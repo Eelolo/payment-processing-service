@@ -1,0 +1,110 @@
+name: payments
+
+# Settings shared by every application container. Defaults are for local development only;
+# override them in .env (see .env.example).
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  restart: unless-stopped
+  # Optional: settings from app/config.py that are not set explicitly below can be put
+  # in .env (DATABASE_URL and RABBITMQ_URL point at the compose services on purpose).
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    API_KEY: ${API_KEY:-local-dev-api-key}
+    WEBHOOK_SECRET: ${WEBHOOK_SECRET:-local-dev-webhook-secret}
+    DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+    RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    GATEWAY_SUCCESS_RATE: ${GATEWAY_SUCCESS_RATE:-0.9}
+    MAX_ATTEMPTS: ${MAX_ATTEMPTS:-3}
+    RETRY_BASE_DELAY_MS: ${RETRY_BASE_DELAY_MS:-1000}
+    CONSUMER_PREFETCH: ${CONSUMER_PREFETCH:-20}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    # The node name (and its data directory) is derived from the hostname: without a fixed
+    # one, every container re-creation starts an empty node and durable queues are lost.
+    hostname: rabbitmq
+    restart: unless-stopped
+    ports:
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  migrate:
+    <<: *app
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  outbox-relay:
+    <<: *app
+    command: ["faststream", "run", "app.relay.main:app"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  consumer:
+    <<: *app
+    command: ["faststream", "run", "app.consumer.main:app"]
+    # Longer than CONSUMER_GRACEFUL_TIMEOUT_S so in-flight payments finish before SIGKILL.
+    stop_grace_period: 30s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  # Demo client endpoint for webhooks, see devtools/webhook_sink.py.
+  webhook-sink:
+    <<: *app
+    command: ["uvicorn", "devtools.webhook_sink:app", "--host", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "${WEBHOOK_SINK_PORT:-8080}:8080"
+    environment:
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-local-dev-webhook-secret}
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
